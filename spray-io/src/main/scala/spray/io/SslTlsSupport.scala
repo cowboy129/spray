@@ -59,6 +59,7 @@ object SslTlsSupport {
           var pendingInboundBytes: ByteBuffer = EmptyByteBuffer // encrypted bytes to be decrypted
           var pendingOutboundBytes: ByteBuffer = EmptyByteBuffer // plaintext bytes to be encrypted
           val pendingEncryptedBytes = new ByteStringBuilder // encrypted bytes to be sent
+          var pendingSentAcks = 0
 
           become(defaultState())
 
@@ -66,6 +67,7 @@ object SslTlsSupport {
           // if the given stream is empty no write is currently pending, otherwise its head is the currently pending write
           // if closedEvent is defined an outbound close is scheduled after the current chunk stream is sent
           def defaultState(remainingOutgoingData: Stream[WriteChunk] = Stream.empty,
+                           writeWantsAck: Option[WriteChunk] = None,
                            closedEvent: Option[Tcp.ConnectionClosed] = None): State = new State {
             if (tracing) log.debug("Transitioning to defaultState")
             val commandPipeline: CPL = {
@@ -87,7 +89,7 @@ object SslTlsSupport {
                   sendEncryptedBytes() // might send an empty Tcp.Write, but always triggers a pending ACK
                   become {
                     if (isOutboundDone) finishingClose(closedEvent)
-                    else waitingForAck(remainingOutgoingData, closedEvent)
+                    else waitingForAck(remainingOutgoingData, writeWantsAck, closedEvent)
                   }
                 }
               case Tcp.PeerClosed     ⇒ receivedUnexpectedPeerClosed()
@@ -102,6 +104,7 @@ object SslTlsSupport {
           // if the given stream is empty no write is currently pending, otherwise its head is the currently pending write
           // if closedEvent is defined an outbound close is scheduled after the current chunk stream is sent
           def waitingForAck(remainingOutgoingData: Stream[WriteChunk] = Stream.empty,
+                            writeWantsAck: Option[WriteChunk] = None,
                             closedEvent: Option[Tcp.ConnectionClosed] = None): State = new State {
             if (tracing) log.debug("Transitioning to waitingForAck")
             val commandPipeline: CPL = {
@@ -111,7 +114,7 @@ object SslTlsSupport {
               case x @ (Tcp.Close | Tcp.ConfirmedClose) ⇒
                 if (closedEvent.isEmpty) {
                   log.debug("Scheduling close of outbound SSL stream due to reception of {}", x)
-                  become(waitingForAck(remainingOutgoingData, Some(x.asInstanceOf[Tcp.CloseCommand].event)))
+                  become(waitingForAck(remainingOutgoingData, writeWantsAck, Some(x.asInstanceOf[Tcp.CloseCommand].event)))
                 } else log.debug("Dropping {} since an SSL-level close is already scheduled", x)
               case Tcp.Abort ⇒ abort() // do we need to close anything in this case?
               case cmd       ⇒ commandPL(cmd)
@@ -124,18 +127,19 @@ object SslTlsSupport {
                 if (isOutboundDone) become(finishingClose(closedEvent)) // else stay in this state
               case WriteChunkAck ⇒
                 if (tracing) log.debug("Received WriteChunkAck in waitingForAck")
+                pendingSentAcks -= 1
                 if (encryptedBytesPending) sendEncryptedBytes()
                 else {
-                  if (pendingOutboundBytes.hasRemaining)
-                    become(defaultState(remainingOutgoingData, closedEvent)) // we need to wait for incoming inbound data
-                  else if (remainingOutgoingData.isEmpty)
+                  if (pendingOutboundBytes.hasRemaining) {
+                    if (pendingSentAcks == 0) become(defaultState(remainingOutgoingData, writeWantsAck, closedEvent)) // we need to wait for incoming inbound data
+                  } else if (remainingOutgoingData.isEmpty) {
+                    writeWantsAck foreach { x => if (x.write.wantsAck) eventPL(x.write.ack) }
                     startClosingOrReturnToDefaultState()
-                  else {
+                  } else {
                     if (tracing) log.debug("Finished sending write chunk")
-                    val WriteChunk(_, write) #:: tail = remainingOutgoingData
-                    if (write.wantsAck) eventPL(write.ack)
-                    if (tail.isEmpty) startClosingOrReturnToDefaultState()
-                    else startEncrypting(tail, sendNow = true, closedEvent)
+                    writeWantsAck foreach { x => if (x.write.wantsAck) eventPL(x.write.ack) }
+                    if (remainingOutgoingData.isEmpty) startClosingOrReturnToDefaultState()
+                    else startEncrypting(remainingOutgoingData, sendNow = true, closedEvent)
                   }
                 }
               case Tcp.PeerClosed          ⇒ receivedUnexpectedPeerClosed()
@@ -146,7 +150,7 @@ object SslTlsSupport {
             def startClosingOrReturnToDefaultState(): Unit =
               closedEvent match {
                 case Some(ev) ⇒ startClosing(ev)
-                case None     ⇒ become(defaultState())
+                case None     ⇒ if (pendingSentAcks == 0) become(defaultState())
               }
           }
 
@@ -175,7 +179,7 @@ object SslTlsSupport {
                     case ex: IllegalStateException ⇒ log.debug("Ignoring exception in finishingClose: {}", ex.getMessage)
                   }
                 } else log.warning("Dropping {} bytes that were received after SSL-level close", data.size)
-              case WriteChunkAck           ⇒ // ignore, expected as ACK for the closing outbound bytes
+              case WriteChunkAck           ⇒ pendingSentAcks -= 1 // ignore, expected as ACK for the closing outbound bytes
               case Tcp.PeerClosed          ⇒ // expected after the final inbound packet, we simply drop it here
               case _: Tcp.ConnectionClosed ⇒ eventPL(closedEvent getOrElse Tcp.PeerClosed)
               case ev                      ⇒ eventPL(ev)
@@ -185,11 +189,11 @@ object SslTlsSupport {
           def startSending(write: Tcp.WriteCommand, remainingOutgoingData: Stream[WriteChunk],
                            closedEvent: Option[Tcp.ConnectionClosed], sendNow: Boolean): Unit =
             if (closedEvent.isEmpty) {
-              if (remainingOutgoingData.isEmpty) {
-                val chunkStream = writeChunkStream(write)
-                if (chunkStream.nonEmpty) startEncrypting(chunkStream, sendNow)
-                // else ignore
-              } else failWrite(write, "there is already another write in progress")
+              val chunkStream = writeChunkStream(write)
+              if (chunkStream.nonEmpty) {
+                startEncrypting(remainingOutgoingData append chunkStream, sendNow)
+              }
+              // else ignore
             } else failWrite(write, "the SSL connection is already closing")
 
           def startEncrypting(chunkStream: Stream[WriteChunk],
@@ -199,12 +203,15 @@ object SslTlsSupport {
               setPendingOutboundBytes(chunkStream.head.buffer)
               encrypt()
               if (sendNow) sendEncryptedBytes()
-              become(waitingForAck(chunkStream, closedEvent))
+              become(waitingForAck(chunkStream.tail, Some(chunkStream.head), closedEvent))
             } else {
               // shortcut for empty writes possibly containing acks (created by user or `writeChunkStream` below)
-              become(waitingForAck(chunkStream, closedEvent))
+              become(waitingForAck(chunkStream.tail, Some(chunkStream.head), closedEvent))
               // must come after the 'become', otherwise an infinite loop might be triggered
-              if (sendNow) eventPipeline(WriteChunkAck)
+              if (sendNow) {
+                pendingSentAcks += 1
+                eventPipeline(WriteChunkAck)
+              }
             }
 
           def startClosing(closedEvent: Tcp.ConnectionClosed): Unit = {
@@ -318,6 +325,7 @@ object SslTlsSupport {
             val result = pendingEncryptedBytes.result()
             pendingEncryptedBytes.clear()
             if (tracing) log.debug("Sending {} encrypted bytes", result.size)
+            pendingSentAcks += 1
             commandPL(Tcp.Write(result, WriteChunkAck))
           }
 
